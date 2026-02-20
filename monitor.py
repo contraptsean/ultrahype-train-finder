@@ -206,12 +206,29 @@ def scrape_hype_train_channels() -> list[str] | None:
                 browser.close()
                 return None
 
-            # Scroll to lazy-load more cards.
-            # Each pass waits 3 s for new content; stops early if the page
-            # height stops growing (no more cards to load).
+            # Twitch uses a virtualised list renderer: cards that scroll out of
+            # view are removed from the DOM. Collecting logins only at the end
+            # therefore only captures the final ~10 visible cards.
+            # Instead, harvest visible cards on every pass before scrolling.
+            seen: set[str] = set()
+            logins: list[str] = []
+
+            def _harvest() -> None:
+                for el in page.query_selector_all(
+                    '[data-a-target="preview-card-channel-link"]'
+                ):
+                    href = el.get_attribute("href") or ""
+                    parts = [p for p in href.split("/") if p]
+                    if len(parts) == 1 and parts[0].lower() not in _EXCLUDED_PATHS:
+                        login = parts[0].lower()
+                        if login not in seen:
+                            seen.add(login)
+                            logins.append(login)
+
             prev_height = 0
             consecutive_no_change = 0
             for _ in range(20):
+                _harvest()  # capture what's visible before scrolling away
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 page.wait_for_timeout(3_000)
                 new_height = page.evaluate("document.body.scrollHeight")
@@ -223,17 +240,7 @@ def scrape_hype_train_channels() -> list[str] | None:
                     consecutive_no_change = 0
                 prev_height = new_height
 
-            elements = page.query_selector_all(
-                '[data-a-target="preview-card-channel-link"]'
-            )
-            logins: list[str] = []
-            for el in elements:
-                href = el.get_attribute("href") or ""
-                parts = [p for p in href.split("/") if p]
-                if len(parts) == 1 and parts[0].lower() not in _EXCLUDED_PATHS:
-                    login = parts[0].lower()
-                    if login not in logins:
-                        logins.append(login)
+            _harvest()  # capture the final viewport after the last scroll
 
             browser.close()
 
