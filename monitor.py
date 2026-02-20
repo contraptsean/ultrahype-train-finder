@@ -206,10 +206,12 @@ def scrape_hype_train_channels() -> list[str] | None:
                 browser.close()
                 return None
 
-            # Twitch uses a virtualised list renderer: cards that scroll out of
-            # view are removed from the DOM. Collecting logins only at the end
-            # therefore only captures the final ~10 visible cards.
-            # Instead, harvest visible cards on every pass before scrolling.
+            # Twitch uses a virtualised list renderer and a custom SimpleBar
+            # scroll container, so window.scrollTo() has no effect.
+            # Instead, scroll the last visible card into view — Playwright
+            # resolves the real scroll container automatically.
+            # Harvest cards before each scroll so virtualised (removed) cards
+            # are still captured.
             seen: set[str] = set()
             logins: list[str] = []
 
@@ -225,20 +227,27 @@ def scrape_hype_train_channels() -> list[str] | None:
                             seen.add(login)
                             logins.append(login)
 
-            prev_height = 0
+            prev_count = 0
             consecutive_no_change = 0
             for _ in range(20):
-                _harvest()  # capture what's visible before scrolling away
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                _harvest()
+
+                # Scroll the last card into view to trigger the next batch
+                cards = page.query_selector_all(
+                    '[data-a-target="preview-card-channel-link"]'
+                )
+                if cards:
+                    cards[-1].scroll_into_view_if_needed()
+
                 page.wait_for_timeout(3_000)
-                new_height = page.evaluate("document.body.scrollHeight")
-                if new_height == prev_height:
+
+                if len(logins) == prev_count:
                     consecutive_no_change += 1
                     if consecutive_no_change >= 2:
                         break
                 else:
                     consecutive_no_change = 0
-                prev_height = new_height
+                prev_count = len(logins)
 
             _harvest()  # capture the final viewport after the last scroll
 
