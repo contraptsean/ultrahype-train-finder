@@ -2,13 +2,15 @@
 ultrahype-train-finder: monitors Twitch for hype trains at or above a
 configurable level and sends Gmail alerts when one is found.
 
-Authentication note
--------------------
-/helix/hypetrain/events requires a *user-scoped* access token with the
-channel:read:hype_train scope granted by each broadcaster. An app-access
-token (client credentials flow) will return 401 for arbitrary channels.
-The tool uses Playwright scraping as the primary discovery mechanism;
-the Helix API call is a best-effort confirmation layer.
+How level detection works
+-------------------------
+1. Playwright scrapes twitch.tv/directory/collection/hype-train for channels
+   currently running hype trains.
+2. For each channel found, Playwright opens the stream page and reads the
+   hype train level directly from the page widget — no Twitch API auth needed.
+3. The Twitch API (client credentials) is only used for the fallback path
+   when the directory scrape fails (/helix/streams to get a broad list of
+   live channels to check).
 """
 
 import os
@@ -22,7 +24,7 @@ from email.mime.text import MIMEText
 
 import requests
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright, BrowserContext, TimeoutError as PlaywrightTimeoutError
 
 # ---------------------------------------------------------------------------
 # Config
@@ -44,6 +46,12 @@ HYPE_TRAIN_DIRECTORY_URL = "https://www.twitch.tv/directory/collection/hype-trai
 TWITCH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 TWITCH_API_BASE = "https://api.twitch.tv/helix"
 
+_CHROME_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
 # Non-channel path segments to filter out when parsing hrefs
 _EXCLUDED_PATHS = {
     "directory", "prime", "bits", "subscriptions", "jobs", "p",
@@ -56,9 +64,8 @@ _EXCLUDED_PATHS = {
 # State
 # ---------------------------------------------------------------------------
 
-# In-memory deduplication: keyed "{login}:{hype_train_instance_id}"
-# Cleared only when the process restarts (one duplicate alert per active train
-# at restart is an acceptable trade-off for simpler code).
+# In-memory deduplication: keyed "{login}:{hour_bucket}"
+# Cleared only when the process restarts.
 alerted_trains: set[str] = set()
 
 _token_state: dict = {"access_token": None, "expires_at": 0.0}
@@ -72,7 +79,7 @@ def log(message: str) -> None:
     print(f"[{ts}] {message}", flush=True)
 
 # ---------------------------------------------------------------------------
-# OAuth — client credentials (app access token)
+# OAuth — client credentials (app access token, used for fallback only)
 # ---------------------------------------------------------------------------
 
 def fetch_app_token(client_id: str, client_secret: str) -> dict:
@@ -103,7 +110,7 @@ def get_valid_token() -> str:
     return _token_state["access_token"]
 
 # ---------------------------------------------------------------------------
-# Twitch API helpers with rate-limit backoff
+# Twitch API helpers (used only for the fallback channel list)
 # ---------------------------------------------------------------------------
 
 def twitch_api_get(
@@ -113,9 +120,7 @@ def twitch_api_get(
 ) -> dict | None:
     """
     GET {TWITCH_API_BASE}{endpoint} with automatic retry on 429 / 5xx.
-
-    Returns the parsed JSON dict on success, or None on permanent failure
-    (including expected 401 for channels that haven't authorised the app).
+    Returns the parsed JSON dict on success, or None on permanent failure.
     """
     url = TWITCH_API_BASE + endpoint
     for attempt in range(max_retries):
@@ -137,10 +142,8 @@ def twitch_api_get(
 
         if resp.status_code == 401:
             if attempt == 0:
-                # Force a token refresh and retry once
                 _token_state["expires_at"] = 0.0
                 continue
-            # Still 401 after refresh → channel hasn't granted scope (expected)
             return None
 
         if resp.status_code == 429:
@@ -149,7 +152,7 @@ def twitch_api_get(
                 wait = max(float(reset_header) - time.time(), 1.0)
             else:
                 wait = min(2 ** attempt + random.uniform(0, 1), 60.0)
-            log(f"Rate limited on {endpoint}. Waiting {wait:.1f}s (attempt {attempt + 1}/{max_retries}) …")
+            log(f"Rate limited on {endpoint}. Waiting {wait:.1f}s …")
             time.sleep(wait)
             continue
 
@@ -165,64 +168,22 @@ def twitch_api_get(
     log(f"All {max_retries} retries exhausted for {endpoint}.")
     return None
 
-
-def get_user_ids_by_login(logins: list[str]) -> dict[str, str]:
-    """
-    Convert a list of channel login names to broadcaster IDs.
-    Returns a dict mapping login (lowercased) → user_id.
-    Batches requests in groups of 100 (Helix API max).
-    """
-    result: dict[str, str] = {}
-    for i in range(0, len(logins), 100):
-        batch = logins[i : i + 100]
-        data = twitch_api_get("/users", params=[("login", login) for login in batch])
-        if data:
-            for user in data.get("data", []):
-                result[user["login"].lower()] = user["id"]
-    return result
-
-
-def get_hype_train_event(broadcaster_id: str) -> dict | None:
-    """
-    Fetch the current hype train status for a broadcaster.
-    Returns the status dict (fields: id, broadcaster_id, level, total, goal,
-    started_at, expires_at) or None if no active train / no API access.
-
-    Uses /helix/hypetrain/status (replaces the removed /helix/hypetrain/events).
-    Note: Returns None for channels that haven't granted channel:read:hype_train.
-    """
-    data = twitch_api_get(
-        "/hypetrain/status",
-        params={"broadcaster_id": broadcaster_id, "first": 1},
-    )
-    if data and data.get("data"):
-        return data["data"][0]
-    return None
-
 # ---------------------------------------------------------------------------
 # Playwright scraping
 # ---------------------------------------------------------------------------
 
-def scrape_hype_train_channels() -> list[tuple[str, int | None]] | None:
+def scrape_hype_train_channels() -> list[str] | None:
     """
-    Scrape the Twitch hype-train directory page.
+    Scrape the Twitch hype-train directory page for channel login names.
 
-    Returns a list of (login, level_or_None) tuples, or None if the scrape
-    failed entirely (caller should use the fallback).
-
-    Level is extracted from the card DOM by looking for "Level X" text in
-    ancestor elements. It may be None if the text isn't found in the DOM.
+    Returns:
+        list[str]  — channel logins (may be empty if directory is empty)
+        None       — scrape failed; caller should use the fallback
     """
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                )
-            )
+            ctx = browser.new_context(user_agent=_CHROME_UA)
             page = ctx.new_page()
 
             log(f"Playwright: navigating to {HYPE_TRAIN_DIRECTORY_URL} …")
@@ -232,7 +193,6 @@ def scrape_hype_train_channels() -> list[tuple[str, int | None]] | None:
                 timeout=30_000,
             )
 
-            # Wait for channel cards to appear
             try:
                 page.wait_for_selector(
                     '[data-a-target="preview-card-channel-link"]',
@@ -240,8 +200,8 @@ def scrape_hype_train_channels() -> list[tuple[str, int | None]] | None:
                 )
             except PlaywrightTimeoutError:
                 log(
-                    "Playwright: selector [data-a-target='preview-card-channel-link'] "
-                    "not found. The Twitch DOM may have changed. Triggering fallback."
+                    "Playwright: [data-a-target='preview-card-channel-link'] not found. "
+                    "The Twitch DOM may have changed. Triggering fallback."
                 )
                 browser.close()
                 return None
@@ -259,74 +219,109 @@ def scrape_hype_train_channels() -> list[tuple[str, int | None]] | None:
             elements = page.query_selector_all(
                 '[data-a-target="preview-card-channel-link"]'
             )
-
-            seen: dict[str, int | None] = {}  # login -> level, deduped
+            logins: list[str] = []
             for el in elements:
                 href = el.get_attribute("href") or ""
                 parts = [p for p in href.split("/") if p]
-                if len(parts) != 1 or parts[0].lower() in _EXCLUDED_PATHS:
-                    continue
-                login = parts[0].lower()
-                if login in seen:
-                    continue
-
-                # Walk up ancestor elements looking for "Level X" text.
-                # Twitch renders the current hype train level on each card.
-                try:
-                    level_val = el.evaluate("""el => {
-                        let node = el;
-                        for (let i = 0; i < 8; i++) {
-                            node = node.parentElement;
-                            if (!node) break;
-                            const text = node.innerText || '';
-                            const m = text.match(/Level\\s+(\\d+)/i);
-                            if (m) {
-                                const lvl = parseInt(m[1], 10);
-                                if (lvl > 0 && lvl < 1000) return lvl;
-                            }
-                        }
-                        return null;
-                    }""")
-                    level: int | None = int(level_val) if level_val is not None else None
-                except Exception:
-                    level = None
-
-                seen[login] = level
+                if len(parts) == 1 and parts[0].lower() not in _EXCLUDED_PATHS:
+                    login = parts[0].lower()
+                    if login not in logins:
+                        logins.append(login)
 
             browser.close()
 
-            result = list(seen.items())
-            if not result:
+            if not logins:
                 log(
-                    "Playwright: scrape succeeded but found 0 channel links. "
-                    "The directory may be empty or the selector has changed."
+                    "Playwright: directory scrape found 0 channels. "
+                    "Directory may be empty or selector has changed."
                 )
             else:
-                levels_found = sum(1 for _, lvl in result if lvl is not None)
-                log(
-                    f"Playwright: found {len(result)} channel(s) "
-                    f"({levels_found} with level visible in DOM)."
-                )
-            return result
+                log(f"Playwright: found {len(logins)} channel(s) in directory.")
+            return logins
 
     except Exception as exc:
-        log(f"Playwright scrape failed: {exc}. Triggering fallback.")
+        log(f"Playwright directory scrape failed: {exc}. Triggering fallback.")
         return None
 
 
-def scrape_hype_train_channels_fallback() -> list[tuple[str, int | None]]:
+def scrape_hype_train_channels_fallback() -> list[str]:
     """
-    Fallback when Playwright fails: fetch the top 100 live streams.
-    Returns (login, None) tuples — level is unknown for fallback channels.
+    Fallback when Playwright fails: fetch the top 100 live streams via
+    /helix/streams and return their channel logins as a population to check.
     """
     log("Using fallback: querying /helix/streams for top 100 live streams.")
     data = twitch_api_get("/streams", params={"first": 100})
     if not data:
         log("Fallback also failed — no channels to check this cycle.")
         return []
-    pairs = [(s["user_login"].lower(), None) for s in data.get("data", [])]
-    log(f"Fallback: got {len(pairs)} live stream(s) to check.")
-    return pairs
+    logins = [s["user_login"].lower() for s in data.get("data", [])]
+    log(f"Fallback: got {len(logins)} live stream(s) to check.")
+    return logins
+
+
+def _visit_channel_for_level(ctx: BrowserContext, login: str) -> int | None:
+    """
+    Open the channel's Twitch stream page in a new tab and extract the current
+    hype train level from the page widget.
+
+    Returns the level as an int, or None if no active hype train is visible.
+    """
+    page = ctx.new_page()
+    try:
+        url = f"https://www.twitch.tv/{login}"
+        page.goto(url, wait_until="domcontentloaded", timeout=20_000)
+
+        # Wait for React to render the stream page and hype train widget.
+        page.wait_for_timeout(5_000)
+
+        level_val = page.evaluate(r"""() => {
+            // Strategy 1: look inside known hype-train widget elements.
+            const htSelectors = [
+                '[data-a-target*="hype"]',
+                '[data-test-selector*="hype"]',
+                '[class*="HypeTrain"]',
+                '[class*="hype-train"]',
+            ];
+            for (const sel of htSelectors) {
+                for (const el of document.querySelectorAll(sel)) {
+                    const text = el.innerText || el.textContent || '';
+                    const m = text.match(/Level\s+(\d+)/i);
+                    if (m) {
+                        const lvl = parseInt(m[1], 10);
+                        if (lvl > 0 && lvl < 1000) return lvl;
+                    }
+                }
+            }
+
+            // Strategy 2: find "Hype Train" text anywhere on the page, then
+            // look for "Level X" within a 400-character window around it.
+            const body = document.body.innerText || '';
+            const idx = body.toLowerCase().indexOf('hype train');
+            if (idx >= 0) {
+                const window = body.slice(Math.max(0, idx - 50), idx + 400);
+                const m = window.match(/Level\s+(\d+)/i);
+                if (m) {
+                    const lvl = parseInt(m[1], 10);
+                    if (lvl > 0 && lvl < 1000) return lvl;
+                }
+            }
+
+            return null;
+        }""")
+
+        level = int(level_val) if level_val is not None else None
+        if level is not None:
+            log(f"  {login}: hype train level {level}")
+        return level
+
+    except PlaywrightTimeoutError:
+        log(f"  {login}: page load timed out — skipping.")
+        return None
+    except Exception as exc:
+        log(f"  {login}: page check failed — {exc}")
+        return None
+    finally:
+        page.close()
 
 # ---------------------------------------------------------------------------
 # Email alerts
@@ -423,70 +418,56 @@ def mark_alerted(channel_login: str, train_id: str) -> None:
 
 def check_once() -> None:
     """Run a single monitoring cycle."""
-    pairs = scrape_hype_train_channels()
-    if pairs is None:
-        pairs = scrape_hype_train_channels_fallback()
+    channels = scrape_hype_train_channels()
+    if channels is None:
+        channels = scrape_hype_train_channels_fallback()
 
-    if not pairs:
+    if not channels:
         log("No channels to check this cycle.")
         return
 
-    logins = [login for login, _ in pairs]
-    log(f"Checking hype train levels for {len(logins)} channel(s) …")
+    log(f"Visiting {len(channels)} stream page(s) to read hype train levels …")
 
-    login_to_id = get_user_ids_by_login(logins)
-    if not login_to_id:
-        log("Could not resolve any channel IDs — skipping cycle.")
-        return
-
+    # One hour bucket for dedup — at most one alert per channel per hour.
+    hour_bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
     alerts_sent = 0
-    skipped_no_level = 0
+    no_train_found = 0
 
-    for login, scraped_level in pairs:
-        user_id = login_to_id.get(login)
-        if not user_id:
-            continue  # channel not found / suspended
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            ctx = browser.new_context(user_agent=_CHROME_UA)
 
-        event = get_hype_train_event(user_id)
+            for login in channels:
+                level = _visit_channel_for_level(ctx, login)
 
-        if event is not None:
-            # API confirmed the level — most accurate path
-            level = event.get("level", 0)
-            train_id = event.get("id", "")
-            display_name = event.get("broadcaster_name", login)
-        elif scraped_level is not None:
-            # API returned 401 (no broadcaster auth), but we read the level
-            # from the page DOM. Use an hourly dedup bucket so we alert at
-            # most once per hour per channel via this path.
-            level = scraped_level
-            hour_bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
-            train_id = f"scraped:{hour_bucket}"
-            display_name = login
-        else:
-            # No level info from either source — skip
-            skipped_no_level += 1
-            continue
+                if level is None:
+                    no_train_found += 1
+                    continue
 
-        if level < CONFIG["min_level"]:
-            continue
+                if level < CONFIG["min_level"]:
+                    continue
 
-        if already_alerted(login, train_id):
-            log(f"Already alerted for {login} (level {level}).")
-            continue
+                train_id = hour_bucket
+                if already_alerted(login, train_id):
+                    log(f"Already alerted for {login} (level {level}) this hour.")
+                    continue
 
-        log(f"ALERT: {display_name} ({login}) is at level {level}!")
-        stream_url = f"https://www.twitch.tv/{login}"
-        sent = send_alert_email(display_name, display_name, level, stream_url)
-        if sent:
-            mark_alerted(login, train_id)
-            alerts_sent += 1
+                log(f"ALERT: {login} is at level {level}!")
+                stream_url = f"https://www.twitch.tv/{login}"
+                sent = send_alert_email(login, login, level, stream_url)
+                if sent:
+                    mark_alerted(login, train_id)
+                    alerts_sent += 1
 
-        # Pace API calls to avoid burning through the rate limit
-        time.sleep(0.5)
+            browser.close()
+
+    except Exception as exc:
+        log(f"Playwright level-check session failed: {exc}")
 
     log(
         f"Cycle complete. Alerts sent: {alerts_sent}. "
-        f"Channels without confirmable level: {skipped_no_level}."
+        f"Channels with no visible hype train: {no_train_found}."
     )
 
 
