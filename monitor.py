@@ -206,14 +206,21 @@ def scrape_hype_train_channels() -> list[str] | None:
                 browser.close()
                 return None
 
-            # Scroll to lazy-load more cards (up to 3 passes)
+            # Scroll to lazy-load more cards.
+            # Each pass waits 3 s for new content; stops early if the page
+            # height stops growing (no more cards to load).
             prev_height = 0
-            for _ in range(3):
+            consecutive_no_change = 0
+            for _ in range(20):
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(2_000)
+                page.wait_for_timeout(3_000)
                 new_height = page.evaluate("document.body.scrollHeight")
                 if new_height == prev_height:
-                    break
+                    consecutive_no_change += 1
+                    if consecutive_no_change >= 2:
+                        break
+                else:
+                    consecutive_no_change = 0
                 prev_height = new_height
 
             elements = page.query_selector_all(
@@ -275,6 +282,8 @@ def _visit_channel_for_level(ctx: BrowserContext, login: str) -> int | None:
         page.wait_for_timeout(5_000)
 
         level_val = page.evaluate(r"""() => {
+            const levelRe = /(?:Lvl|Level)\s*[:\-]?\s*(\d+)/i;
+
             // Strategy 1: look inside known hype-train widget elements.
             const htSelectors = [
                 '[data-a-target*="hype"]',
@@ -285,7 +294,7 @@ def _visit_channel_for_level(ctx: BrowserContext, login: str) -> int | None:
             for (const sel of htSelectors) {
                 for (const el of document.querySelectorAll(sel)) {
                     const text = el.innerText || el.textContent || '';
-                    const m = text.match(/Level\s+(\d+)/i);
+                    const m = text.match(levelRe);
                     if (m) {
                         const lvl = parseInt(m[1], 10);
                         if (lvl > 0 && lvl < 1000) return lvl;
@@ -294,12 +303,12 @@ def _visit_channel_for_level(ctx: BrowserContext, login: str) -> int | None:
             }
 
             // Strategy 2: find "Hype Train" text anywhere on the page, then
-            // look for "Level X" within a 400-character window around it.
+            // look for "Lvl X" or "Level X" within a 400-character window.
             const body = document.body.innerText || '';
             const idx = body.toLowerCase().indexOf('hype train');
             if (idx >= 0) {
                 const window = body.slice(Math.max(0, idx - 50), idx + 400);
-                const m = window.match(/Level\s+(\d+)/i);
+                const m = window.match(levelRe);
                 if (m) {
                     const lvl = parseInt(m[1], 10);
                     if (lvl > 0 && lvl < 1000) return lvl;
