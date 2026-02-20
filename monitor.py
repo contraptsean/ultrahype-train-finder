@@ -227,18 +227,18 @@ def scrape_hype_train_channels() -> list[str] | None:
                             seen.add(login)
                             logins.append(login)
 
+            # Simulate mouse-wheel scrolling over the centre of the viewport.
+            # This reliably fires Twitch's IntersectionObserver-based lazy
+            # loader regardless of which DOM element owns the scroll container.
+            vw = page.viewport_size or {"width": 1280, "height": 800}
+            cx, cy = vw["width"] // 2, vw["height"] // 2
+            page.mouse.move(cx, cy)
+
             prev_count = 0
             consecutive_no_change = 0
             for _ in range(20):
                 _harvest()
-
-                # Scroll the last card into view to trigger the next batch
-                cards = page.query_selector_all(
-                    '[data-a-target="preview-card-channel-link"]'
-                )
-                if cards:
-                    cards[-1].scroll_into_view_if_needed()
-
+                page.mouse.wheel(0, 3000)   # scroll down ~3 screen-heights
                 page.wait_for_timeout(3_000)
 
                 if len(logins) == prev_count:
