@@ -203,14 +203,15 @@ def get_hype_train_event(broadcaster_id: str) -> dict | None:
 # Playwright scraping
 # ---------------------------------------------------------------------------
 
-def scrape_hype_train_channels() -> list[str] | None:
+def scrape_hype_train_channels() -> list[tuple[str, int | None]] | None:
     """
-    Scrape the Twitch hype-train directory page and return a list of channel
-    login names currently running hype trains.
+    Scrape the Twitch hype-train directory page.
 
-    Returns:
-        list[str]  — channel logins (may be empty if directory is empty)
-        None       — scrape failed; caller should use the fallback
+    Returns a list of (login, level_or_None) tuples, or None if the scrape
+    failed entirely (caller should use the fallback).
+
+    Level is extracted from the card DOM by looking for "Level X" text in
+    ancestor elements. It may be None if the text isn't found in the DOM.
     """
     try:
         with sync_playwright() as pw:
@@ -255,51 +256,77 @@ def scrape_hype_train_channels() -> list[str] | None:
                     break
                 prev_height = new_height
 
-            # Extract channel login names from channel-link hrefs
             elements = page.query_selector_all(
                 '[data-a-target="preview-card-channel-link"]'
             )
-            logins: list[str] = []
+
+            seen: dict[str, int | None] = {}  # login -> level, deduped
             for el in elements:
                 href = el.get_attribute("href") or ""
-                # href is like "/channelname" — strip the leading slash
                 parts = [p for p in href.split("/") if p]
-                if len(parts) == 1 and parts[0].lower() not in _EXCLUDED_PATHS:
-                    logins.append(parts[0].lower())
+                if len(parts) != 1 or parts[0].lower() in _EXCLUDED_PATHS:
+                    continue
+                login = parts[0].lower()
+                if login in seen:
+                    continue
+
+                # Walk up ancestor elements looking for "Level X" text.
+                # Twitch renders the current hype train level on each card.
+                try:
+                    level_val = el.evaluate("""el => {
+                        let node = el;
+                        for (let i = 0; i < 8; i++) {
+                            node = node.parentElement;
+                            if (!node) break;
+                            const text = node.innerText || '';
+                            const m = text.match(/Level\\s+(\\d+)/i);
+                            if (m) {
+                                const lvl = parseInt(m[1], 10);
+                                if (lvl > 0 && lvl < 1000) return lvl;
+                            }
+                        }
+                        return null;
+                    }""")
+                    level: int | None = int(level_val) if level_val is not None else None
+                except Exception:
+                    level = None
+
+                seen[login] = level
 
             browser.close()
 
-            unique_logins = list(dict.fromkeys(logins))  # dedupe, preserve order
-            if not unique_logins:
+            result = list(seen.items())
+            if not result:
                 log(
                     "Playwright: scrape succeeded but found 0 channel links. "
                     "The directory may be empty or the selector has changed."
                 )
             else:
-                log(f"Playwright: found {len(unique_logins)} channel(s) in directory.")
-            return unique_logins
+                levels_found = sum(1 for _, lvl in result if lvl is not None)
+                log(
+                    f"Playwright: found {len(result)} channel(s) "
+                    f"({levels_found} with level visible in DOM)."
+                )
+            return result
 
     except Exception as exc:
         log(f"Playwright scrape failed: {exc}. Triggering fallback.")
         return None
 
 
-def scrape_hype_train_channels_fallback() -> list[str]:
+def scrape_hype_train_channels_fallback() -> list[tuple[str, int | None]]:
     """
-    Fallback when Playwright fails: fetch the top 100 live streams and return
-    their channel logins as a broad population to check for hype trains.
-
-    Note: This returns all top streams, not just hype-train channels. Most API
-    calls to /helix/hypetrain/events will return 401 or empty data for these.
+    Fallback when Playwright fails: fetch the top 100 live streams.
+    Returns (login, None) tuples — level is unknown for fallback channels.
     """
     log("Using fallback: querying /helix/streams for top 100 live streams.")
     data = twitch_api_get("/streams", params={"first": 100})
     if not data:
         log("Fallback also failed — no channels to check this cycle.")
         return []
-    logins = [s["user_login"].lower() for s in data.get("data", [])]
-    log(f"Fallback: got {len(logins)} live stream(s) to check.")
-    return logins
+    pairs = [(s["user_login"].lower(), None) for s in data.get("data", [])]
+    log(f"Fallback: got {len(pairs)} live stream(s) to check.")
+    return pairs
 
 # ---------------------------------------------------------------------------
 # Email alerts
@@ -396,44 +423,55 @@ def mark_alerted(channel_login: str, train_id: str) -> None:
 
 def check_once() -> None:
     """Run a single monitoring cycle."""
-    channels = scrape_hype_train_channels()
-    if channels is None:
-        channels = scrape_hype_train_channels_fallback()
+    pairs = scrape_hype_train_channels()
+    if pairs is None:
+        pairs = scrape_hype_train_channels_fallback()
 
-    if not channels:
+    if not pairs:
         log("No channels to check this cycle.")
         return
 
-    log(f"Checking hype train levels for {len(channels)} channel(s) …")
+    logins = [login for login, _ in pairs]
+    log(f"Checking hype train levels for {len(logins)} channel(s) …")
 
-    login_to_id = get_user_ids_by_login(channels)
+    login_to_id = get_user_ids_by_login(logins)
     if not login_to_id:
         log("Could not resolve any channel IDs — skipping cycle.")
         return
 
     alerts_sent = 0
-    skipped_auth = 0
+    skipped_no_level = 0
 
-    for login in channels:
+    for login, scraped_level in pairs:
         user_id = login_to_id.get(login)
         if not user_id:
             continue  # channel not found / suspended
 
         event = get_hype_train_event(user_id)
 
-        if event is None:
-            skipped_auth += 1
+        if event is not None:
+            # API confirmed the level — most accurate path
+            level = event.get("level", 0)
+            train_id = event.get("id", "")
+            display_name = event.get("broadcaster_name", login)
+        elif scraped_level is not None:
+            # API returned 401 (no broadcaster auth), but we read the level
+            # from the page DOM. Use an hourly dedup bucket so we alert at
+            # most once per hour per channel via this path.
+            level = scraped_level
+            hour_bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+            train_id = f"scraped:{hour_bucket}"
+            display_name = login
+        else:
+            # No level info from either source — skip
+            skipped_no_level += 1
             continue
-
-        level = event.get("level", 0)
-        train_id = event.get("id", "")
-        display_name = event.get("broadcaster_name", login)
 
         if level < CONFIG["min_level"]:
             continue
 
         if already_alerted(login, train_id):
-            log(f"Already alerted for {login} train {train_id} (level {level}).")
+            log(f"Already alerted for {login} (level {level}).")
             continue
 
         log(f"ALERT: {display_name} ({login}) is at level {level}!")
@@ -448,7 +486,7 @@ def check_once() -> None:
 
     log(
         f"Cycle complete. Alerts sent: {alerts_sent}. "
-        f"Channels skipped (no API access): {skipped_auth}."
+        f"Channels without confirmable level: {skipped_no_level}."
     )
 
 
