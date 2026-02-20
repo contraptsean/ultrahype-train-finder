@@ -184,13 +184,15 @@ def get_user_ids_by_login(logins: list[str]) -> dict[str, str]:
 
 def get_hype_train_event(broadcaster_id: str) -> dict | None:
     """
-    Fetch the most recent hype train event for a broadcaster.
-    Returns the event dict (with an 'event_data' sub-dict) or None.
+    Fetch the current hype train status for a broadcaster.
+    Returns the status dict (fields: id, broadcaster_id, level, total, goal,
+    started_at, expires_at) or None if no active train / no API access.
 
+    Uses /helix/hypetrain/status (replaces the removed /helix/hypetrain/events).
     Note: Returns None for channels that haven't granted channel:read:hype_train.
     """
     data = twitch_api_get(
-        "/hypetrain/events",
+        "/hypetrain/status",
         params={"broadcaster_id": broadcaster_id, "first": 1},
     )
     if data and data.get("data"):
@@ -423,10 +425,9 @@ def check_once() -> None:
             skipped_auth += 1
             continue
 
-        event_data = event.get("event_data", {})
-        level = event_data.get("level", 0)
-        train_id = event_data.get("id", "")
-        display_name = event_data.get("broadcaster_name", login)
+        level = event.get("level", 0)
+        train_id = event.get("id", "")
+        display_name = event.get("broadcaster_name", login)
 
         if level < CONFIG["min_level"]:
             continue
